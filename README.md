@@ -67,12 +67,7 @@
 ![signup.png](./exec/docs/imgs/signup.png)
 ![signup.png](./exec/docs/imgs/signup_success.png)
 
-### 3. 얼굴인식 로그인
-- 얼굴인식 등록
-  ![face_register.png](./exec/docs/imgs/face_register.png)
 
-- 얼굴인식 로그인
-  ![face_login.png](./exec/docs/imgs/face_login.png)
 
 ### 4. 사용자 화면 입장
 - 사용자의 프로젝트, 사용자 당일 커밋 수, 사용자 당일 MR 요청 수 제공 
