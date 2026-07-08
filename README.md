@@ -106,8 +106,8 @@
 - **기능 설명**:
   - **GitLab MR 감지**: GitLab Webhook을 통해 MR 이벤트를 수신하면, 프로젝트 ID, MR IID, 대상 브랜치, MR 제목/설명, 변경 파일 diff를 수집합니다.
   - **변경 유형 분류**: MR 제목, 설명, target branch, 변경 파일 경로, diff 내용을 기반으로 `auth`, `api-contract`, `async`, `security`, `persistence`, `operations`, `rag-review`, `testing` 등 리뷰 카테고리와 위험도를 분류합니다.
-  - **Code RAG**: 프로젝트 코드를 chunking한 뒤 GraphCodeBERT 기반 embedding으로 검색합니다. 각 코드 chunk에는 파일 경로, 모듈, 언어, 클래스명, 메서드명, annotation, symbol, category hint, content metadata를 함께 저장합니다.
-  - **검색 결과 재정렬**: embedding 유사도만 사용하지 않고 같은 파일, 같은 모듈 경로, 같은 category, symbol overlap, class match 여부를 기준으로 관련 코드를 reranking합니다. 선택된 코드 evidence에는 `same category`, `symbol overlap` 같은 선택 이유를 남깁니다.
+  - **Code RAG**: 프로젝트 코드를 tree-sitter로 함수/메서드 단위 chunking한 뒤 GraphCodeBERT 기반 embedding으로 검색합니다. 각 코드 chunk에는 파일 경로, 모듈, 언어, 클래스명, 메서드명, annotation, symbol, AST symbol, category hint, content metadata를 함께 저장합니다.
+  - **검색 결과 재정렬**: embedding 유사도만 사용하지 않고 같은 파일, 같은 모듈 경로, 같은 category, symbol overlap, tree-sitter AST symbol overlap, class match 여부를 기준으로 관련 코드를 reranking합니다. 선택된 코드 evidence에는 `same category`, `symbol overlap`, `ast symbol overlap` 같은 선택 이유를 남깁니다.
   - **Document RAG**: 코드뿐 아니라 프로젝트 문서도 리뷰 근거로 활용합니다. `docs/review-rules`, `docs/api`, `docs/adr`, `docs/architecture` 문서를 heading 단위로 chunking하고, 변경 유형에 맞는 review rule, API contract, ADR, architecture 문서를 검색합니다.
   - **Evidence Pack 생성**: LLM에 raw diff만 넘기지 않고 `Change`, `Classification`, `Changed Code`, `Related Code`, `Project Rule Evidence`, `API Contract Evidence`, `Architecture Decision Evidence`, `Historical Review Findings`로 구성된 Evidence Pack을 제공합니다.
   - **Structured Findings 생성**: LLM은 HTML 문자열이 아니라 `severity`, `category`, `file`, `line`, `issue`, `whyItMatters`, `suggestion`, `evidence`를 포함한 structured findings JSON을 생성합니다. 기존 클라이언트 호환을 위해 `review`, `summary`, `techStacks` 응답도 유지합니다.

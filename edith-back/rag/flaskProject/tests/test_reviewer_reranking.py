@@ -16,6 +16,7 @@ def load_reviewer():
         'app.chunking': types.ModuleType('app.chunking'),
         'app.chunking.get_code': types.ModuleType('app.chunking.get_code'),
         'app.services': types.ModuleType('app.services'),
+        'app.services.ast_code_analysis': types.ModuleType('app.services.ast_code_analysis'),
         'app.services.code_metadata': types.ModuleType('app.services.code_metadata'),
         'app.services.document_rag': types.ModuleType('app.services.document_rag'),
         'app.services.embeddings': types.ModuleType('app.services.embeddings'),
@@ -30,6 +31,7 @@ def load_reviewer():
         'langchain.text_splitter': types.ModuleType('langchain.text_splitter'),
     }
     modules['app.chunking.get_code'].GitLabCodeChunker = Dummy
+    modules['app.services.ast_code_analysis'].extract_ast_symbols = lambda language, code: []
     modules['app.services.code_metadata'].build_code_chunk_metadata = lambda path, language, content: {}
     modules['app.services.code_metadata'].extract_symbols = lambda content: []
     modules['app.services.document_rag'].find_document_evidence = lambda *args, **kwargs: {}
@@ -68,6 +70,7 @@ class ReviewerRerankingTest(unittest.TestCase):
                     'path': 'other/GenericController.java',
                     'categoryHints': 'api-contract',
                     'symbols': '',
+                    'astSymbols': '',
                 },
             },
             {
@@ -78,6 +81,7 @@ class ReviewerRerankingTest(unittest.TestCase):
                     'path': 'edith-back/user/src/main/java/UserController.java',
                     'categoryHints': 'auth, api-contract',
                     'symbols': 'cookieUtil.addAccessToken',
+                    'astSymbols': 'cookieUtil, addAccessToken, response',
                     'className': 'UserController',
                 },
             },
@@ -87,12 +91,14 @@ class ReviewerRerankingTest(unittest.TestCase):
             results,
             'edith-back/user/src/main/java/UserController.java',
             ['auth'],
-            ['cookieUtil.addAccessToken']
+            ['cookieUtil.addAccessToken'],
+            ['addAccessToken']
         )
 
         self.assertEqual(reranked[0]['path'], 'edith-back/user/src/main/java/UserController.java')
         self.assertIn('same category: auth', reranked[0]['reason'])
         self.assertIn('symbol overlap: cookieUtil.addAccessToken', reranked[0]['reason'])
+        self.assertIn('ast symbol overlap: addAccessToken', reranked[0]['reason'])
 
     def test_builds_evidence_pack_sections(self):
         reviewer = load_reviewer()

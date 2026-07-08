@@ -1,5 +1,10 @@
 import re
 from pathlib import Path
+try:
+    from app.services.ast_code_analysis import extract_ast_symbols
+except ModuleNotFoundError:
+    def extract_ast_symbols(language, code):
+        return []
 
 
 def build_code_chunk_metadata(path, language, content):
@@ -12,6 +17,7 @@ def build_code_chunk_metadata(path, language, content):
         'methodName': infer_method_name(language, content),
         'annotations': ', '.join(extract_annotations(content)),
         'symbols': ', '.join(extract_symbols(content)),
+        'astSymbols': ', '.join(extract_ast_symbols(language, content)),
         'categoryHints': ', '.join(infer_category_hints(path, content)),
         'content': content,
     }

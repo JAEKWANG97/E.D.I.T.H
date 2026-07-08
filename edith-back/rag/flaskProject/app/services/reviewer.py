@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import re
 from app.chunking.get_code import GitLabCodeChunker
+from app.services.ast_code_analysis import extract_ast_symbols
 from app.services.code_metadata import build_code_chunk_metadata, extract_symbols
 from app.services.document_rag import find_document_evidence, format_classification, format_document_evidence
 from app.services.embeddings import CodeEmbeddingProcessor
@@ -101,8 +102,9 @@ def getCodeReview(url, token, projectId, branch, changes, mr_title='', mr_descri
                                                               language)
             retrieval_queries = build_retrieval_queries(diff, changed_blocks, changed_file_context)
             changed_symbols = extract_symbols(f"{diff}\n{changed_file_context}")
+            changed_ast_symbols = extract_ast_symbols(language, changed_file_context)
             similar_codes = query_relevant_code(vectorDB, retrieval_queries, change['path'], categories,
-                                                changed_symbols)
+                                                changed_symbols, changed_ast_symbols)
             historical_findings = find_historical_findings(
                 projectId,
                 change['path'],
@@ -333,7 +335,8 @@ def build_retrieval_queries(diff, changed_blocks, changed_file_context):
     return queries[:3]
 
 
-def query_relevant_code(vectorDB, retrieval_queries, changed_path='', categories=None, changed_symbols=None):
+def query_relevant_code(vectorDB, retrieval_queries, changed_path='', categories=None, changed_symbols=None,
+                        changed_ast_symbols=None):
     results = []
     seen = set()
     for query in retrieval_queries:
@@ -344,26 +347,46 @@ def query_relevant_code(vectorDB, retrieval_queries, changed_path='', categories
                 continue
             seen.add(fingerprint)
             results.append(item)
-    return rerank_code_results(results, changed_path, categories or [], changed_symbols or [])[:6]
+    return rerank_code_results(
+        results,
+        changed_path,
+        categories or [],
+        changed_symbols or [],
+        changed_ast_symbols or []
+    )[:6]
 
 
-def rerank_code_results(results, changed_path, categories, changed_symbols):
+def rerank_code_results(results, changed_path, categories, changed_symbols, changed_ast_symbols=None):
     def score(item):
         distance = item.get('score', 1.0) if isinstance(item, dict) else 1.0
         value = -distance
-        for reason, weight in code_match_reasons(item, changed_path, categories, changed_symbols):
+        for reason, weight in code_match_reasons(
+                item,
+                changed_path,
+                categories,
+                changed_symbols,
+                changed_ast_symbols or []
+        ):
             value += weight
         return value
 
     reranked = sorted(results, key=score, reverse=True)
     for item in reranked:
         if isinstance(item, dict):
-            reasons = [reason for reason, _ in code_match_reasons(item, changed_path, categories, changed_symbols)]
+            reasons = [
+                reason for reason, _ in code_match_reasons(
+                    item,
+                    changed_path,
+                    categories,
+                    changed_symbols,
+                    changed_ast_symbols or []
+                )
+            ]
             item['reason'] = ', '.join(reasons) if reasons else 'embedding similarity'
     return reranked
 
 
-def code_match_reasons(item, changed_path, categories, changed_symbols):
+def code_match_reasons(item, changed_path, categories, changed_symbols, changed_ast_symbols=None):
     if not isinstance(item, dict):
         return []
 
@@ -387,6 +410,14 @@ def code_match_reasons(item, changed_path, categories, changed_symbols):
     for symbol in changed_symbols:
         if symbol and (symbol in metadata_symbols or symbol in content):
             reasons.append((f"symbol overlap: {symbol}", 0.45))
+            break
+
+    metadata_ast_symbols = metadata.get('astSymbols') or ', '.join(
+        extract_ast_symbols(metadata.get('language', item.get('language', '')), content)
+    )
+    for symbol in changed_ast_symbols or []:
+        if symbol and symbol in metadata_ast_symbols:
+            reasons.append((f"ast symbol overlap: {symbol}", 0.55))
             break
 
     if metadata.get('className') and metadata.get('className') in changed_path:
