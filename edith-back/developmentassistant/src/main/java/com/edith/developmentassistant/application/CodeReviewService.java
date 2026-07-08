@@ -18,8 +18,10 @@ import com.edith.developmentassistant.infrastructure.repository.jpa.ProjectRepos
 import com.edith.developmentassistant.application.dto.DashboardDto;
 import com.edith.developmentassistant.application.dto.request.RegisterProjectServiceRequest;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.OptionalInt;
 import java.util.Set;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -65,16 +67,18 @@ public class CodeReviewService {
 
             log.info("Decoded Advice: {}", advice);
 
-            CodeReviewResponse response = requestCodeReview(projectId, project.getToken(), mergeDiff, changes,
+            CodeReviewResponse response = requestCodeReview(projectId, mergeRequestIid, project.getToken(), mergeDiff, changes,
                     webhookEvent.getObjectAttributes().getTitle(), webhookEvent.getObjectAttributes().getDescription());
 
             log.info("Decoded Response: {}", response);
+            log.info("Structured review findings count: {}",
+                    response.getFindings() == null ? 0 : response.getFindings().size());
 
             saveMRSummary(webhookEvent, mergeRequestIid, response, project);
 
             updateDashboard(projectId.intValue(), response, recentCommitMessage, advice, fixLogs);
 
-            postMergeRequestComment(projectId, mergeRequestIid, project.getToken(), response);
+            postMergeRequestComment(projectId, mergeRequestIid, project.getToken(), response, mergeDiff);
 
         } catch (Exception e) {
             log.error("Error occurred while processing webhook event", e);
@@ -109,12 +113,14 @@ public class CodeReviewService {
         return ragServiceClient.sendAdviceRequest(projectId, token, mrSummaries);
     }
 
-    private CodeReviewResponse requestCodeReview(Long projectId, String token, MergeRequestDiffResponse mergeDiff,
+    private CodeReviewResponse requestCodeReview(Long projectId, Long mergeRequestIid, String token,
+                                                 MergeRequestDiffResponse mergeDiff,
                                                  List<CodeReviewChanges> changes, String mrTitle,
                                                  String mrDescription) {
         CodeReviewRequest request = CodeReviewRequest.builder()
                 .url("https://lab.ssafy.com")
                 .projectId(projectId.toString())
+                .mrIid(String.valueOf(mergeRequestIid))
                 .branch(mergeDiff.getTargetBranch())
                 .mrTitle(mrTitle)
                 .mrDescription(mrDescription)
@@ -179,8 +185,43 @@ public class CodeReviewService {
     }
 
     private void postMergeRequestComment(Long projectId, Long mergeRequestIid, String token,
-                                         CodeReviewResponse response) {
-        gitLabApi.addMergeRequestComment(projectId, mergeRequestIid, token, response.getReview(),
+                                         CodeReviewResponse response, MergeRequestDiffResponse mergeDiff) {
+        List<CodeReviewResponse.CodeReviewFinding> fallbackFindings = postInlineDiscussions(
+                projectId, mergeRequestIid, token, response, mergeDiff);
+        boolean allFindingsPostedInline = response.getFindings() != null
+                && !response.getFindings().isEmpty()
+                && fallbackFindings.isEmpty();
+        String reviewBody = allFindingsPostedInline
+                ? "Structured findings were posted as inline discussions."
+                : CodeReviewCommentFormatter.formatReviewBody(fallbackFindings, response.getReview());
+        gitLabApi.addMergeRequestComment(projectId, mergeRequestIid, token,
+                reviewBody,
                 response.getSummary());
+    }
+
+    private List<CodeReviewResponse.CodeReviewFinding> postInlineDiscussions(Long projectId, Long mergeRequestIid,
+                                                                             String token,
+                                                                             CodeReviewResponse response,
+                                                                             MergeRequestDiffResponse mergeDiff) {
+        if (response.getFindings() == null || response.getFindings().isEmpty() || mergeDiff.getDiffRefs() == null) {
+            return response.getFindings() == null ? Collections.emptyList() : response.getFindings();
+        }
+
+        List<CodeReviewResponse.CodeReviewFinding> fallbackFindings = new ArrayList<>();
+        for (CodeReviewResponse.CodeReviewFinding finding : response.getFindings()) {
+            OptionalInt newLine = CodeReviewCommentFormatter.parseNewLine(finding.getLine());
+            if (finding.getFile() == null || finding.getFile().isBlank() || newLine.isEmpty()) {
+                fallbackFindings.add(finding);
+                continue;
+            }
+
+            boolean posted = gitLabApi.addMergeRequestDiscussion(projectId, mergeRequestIid, token,
+                    finding.getFile(), newLine.getAsInt(), mergeDiff.getDiffRefs(),
+                    CodeReviewCommentFormatter.formatInlineBody(finding));
+            if (!posted) {
+                fallbackFindings.add(finding);
+            }
+        }
+        return fallbackFindings;
     }
 }

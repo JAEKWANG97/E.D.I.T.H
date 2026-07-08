@@ -30,10 +30,7 @@ class CodeEmbeddingProcessor:
                     if not text:
                         continue
                     texts.append(text)
-                    metadatas.append({
-                        'path': snippet.get('path', 'unknown'),
-                        'language': snippet.get('language', 'unknown')
-                    })
+                    metadatas.append(to_chroma_metadata(snippet))
                 else:
                     texts.append(str(snippet))
                     metadatas.append({'path': 'unknown', 'language': 'unknown'})
@@ -61,7 +58,8 @@ class CodeEmbeddingProcessor:
                 'path': doc.metadata.get('path', 'unknown'),
                 'language': doc.metadata.get('language', 'unknown'),
                 'content': doc.page_content,
-                'score': score
+                'score': score,
+                'metadata': doc.metadata
             } for doc, score in results]
             return related_codes
         except Exception as e:
@@ -97,3 +95,21 @@ class CodeEmbeddingProcessor:
         except Exception as e:
             print(f"Critical error during cleanup: {e}")
             return False
+
+
+def to_chroma_metadata(snippet):
+    metadata = {}
+    for key, value in snippet.items():
+        if key in {'text', 'code'}:
+            continue
+        if value is None:
+            metadata[key] = ''
+        elif isinstance(value, (str, int, float, bool)):
+            metadata[key] = value
+        elif isinstance(value, (list, tuple, set)):
+            metadata[key] = ', '.join(str(item) for item in value)
+        else:
+            metadata[key] = str(value)
+    metadata.setdefault('path', 'unknown')
+    metadata.setdefault('language', 'unknown')
+    return metadata

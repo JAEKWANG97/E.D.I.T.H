@@ -74,14 +74,45 @@ def code_review():
     changes = data.get('changes')
     mr_title = data.get('mrTitle') or data.get('title') or ''
     mr_description = data.get('mrDescription') or data.get('description') or ''
+    mr_iid = data.get('mrIid') or data.get('mergeRequestIid') or ''
     logger.info(f'code review make = {projectId}')
 
-    review, portfolio, techStack = reviewer.getCodeReview(url, token, projectId, branch, changes, mr_title,
-                                                           mr_description)
+    review, portfolio, techStack, findings = reviewer.getCodeReview(url, token, projectId, branch, changes, mr_title,
+                                                                     mr_description, mr_iid)
     if review and portfolio:
-        return jsonify({'status': 'success', 'review': review, 'techStacks': techStack, 'summary': portfolio})
+        return jsonify({
+            'status': 'success',
+            'review': review,
+            'techStacks': techStack,
+            'summary': portfolio,
+            'findings': findings
+        })
     else:
         return jsonify({'status': 'fail', 'message': '코드 리뷰 생성 중 오류가 발생했습니다.'}), 500
+
+
+@routes_bp.route('/rag/review-memory/status', methods=['POST'])
+def update_review_memory_status():
+    from app.services.review_memory import update_review_finding_status, VALID_STATUSES
+
+    data = request.get_json() or {}
+    project_id = data.get('projectId')
+    mr_id = data.get('mrId')
+    finding_id = data.get('findingId')
+    status = data.get('status')
+
+    if not project_id or not finding_id or status not in VALID_STATUSES:
+        return jsonify({
+            'status': 'fail',
+            'message': 'projectId, findingId, and valid status are required.',
+            'validStatuses': sorted(VALID_STATUSES)
+        }), 400
+
+    updated = update_review_finding_status(project_id, mr_id or '', finding_id, status)
+    if not updated:
+        return jsonify({'status': 'fail', 'message': 'review finding was not found.'}), 404
+
+    return jsonify({'status': 'success'})
 
 
 @routes_bp.route('/rag/advice', methods=['POST'])

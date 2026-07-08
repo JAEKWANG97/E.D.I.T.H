@@ -3,7 +3,11 @@ import os
 from pathlib import Path
 import re
 from app.chunking.get_code import GitLabCodeChunker
+from app.services.code_metadata import build_code_chunk_metadata, extract_symbols
+from app.services.document_rag import find_document_evidence, format_classification, format_document_evidence
 from app.services.embeddings import CodeEmbeddingProcessor
+from app.services.review_memory import find_historical_findings, format_historical_findings, persist_review_findings
+from app.services.review_output import normalize_review_payload, parse_model_json
 from langchain_core.output_parsers import StrOutputParser
 from langchain.memory import ConversationBufferMemory
 from langchain_core.prompts import ChatPromptTemplate
@@ -20,7 +24,7 @@ MAX_SIMILAR_CODE_CHARS = 1400
 MAX_RETRIEVAL_QUERY_CHARS = 2500
 
 
-def getCodeReview(url, token, projectId, branch, changes, mr_title='', mr_description=''):
+def getCodeReview(url, token, projectId, branch, changes, mr_title='', mr_description='', mr_iid=''):
     chunker = None
     vectorDB = None
     uuid = generate_uuid()
@@ -40,7 +44,7 @@ def getCodeReview(url, token, projectId, branch, changes, mr_title='', mr_descri
         # 2. 파일별 임베딩
         project_path = chunker.clone_project()
         if not project_path:
-            return '', '', []
+            return '', '', [], []
 
         # 3. 리뷰 할 코드들 메서드 Chunking
         file_chunks = []
@@ -70,13 +74,19 @@ def getCodeReview(url, token, projectId, branch, changes, mr_title='', mr_descri
                     chunks = chunker.chunk_file(str(file_path), language)
                     relative_path = str(file_path.relative_to(project_path))
                     for chunk in chunks:
+                        chunk_metadata = build_code_chunk_metadata(relative_path, language, chunk)
                         file_chunks.append({
                             'text': chunk,
-                            'path': relative_path,
-                            'language': language
+                            **chunk_metadata
                         })
 
         vectorDB.store_embeddings(file_chunks)
+        document_evidence = find_document_evidence(project_path, changes, mr_title, mr_description, branch)
+        formatted_review_rules = format_document_evidence(document_evidence, {'review-rule'})
+        formatted_api_contracts = format_document_evidence(document_evidence, {'api-contract'})
+        formatted_architecture = format_document_evidence(document_evidence, {'architecture-decision', 'architecture'})
+        classification = document_evidence.get('classification', {})
+        categories = classification.get('categories', [])
 
         review_queries = []  # path, diff (전문), 참고할 코드 (메서드)
         for change in changes:
@@ -90,29 +100,44 @@ def getCodeReview(url, token, projectId, branch, changes, mr_title='', mr_descri
             changed_file_context = build_changed_file_context(project_path, change['path'], changed_blocks, chunker,
                                                               language)
             retrieval_queries = build_retrieval_queries(diff, changed_blocks, changed_file_context)
-            similar_codes = query_relevant_code(vectorDB, retrieval_queries)
+            changed_symbols = extract_symbols(f"{diff}\n{changed_file_context}")
+            similar_codes = query_relevant_code(vectorDB, retrieval_queries, change['path'], categories,
+                                                changed_symbols)
+            historical_findings = find_historical_findings(
+                projectId,
+                change['path'],
+                categories,
+                mr_iid,
+                query_text=f"{diff}\n{changed_file_context}"
+            )
 
             review_queries.append({
                 'path': change['path'],
                 'language': language,
                 'diff': diff,
+                'classification': format_classification(classification),
                 'changed_blocks': format_changed_blocks(changed_blocks),
                 'surrounding_context': changed_file_context,
-                'similar_codes': format_similar_codes(similar_codes)
+                'similar_codes': format_similar_codes(similar_codes),
+                'project_rules': formatted_review_rules,
+                'api_contracts': formatted_api_contracts,
+                'architecture_decisions': formatted_architecture,
+                'historical_findings': format_historical_findings(historical_findings)
             })
+            review_queries[-1]['evidence_pack'] = build_evidence_pack(review_queries[-1])
 
         # 5. 메서드 별 관련 코드 가져와 리트리버 생성, 질의
         llm_model = LLMModel()
         llm = llm_model.llm
 
         # 6. LLM 에 질의해 결과 반환
-        result = get_code_review(projectId, branch, review_queries, llm, mr_title, mr_description)
+        result = get_code_review(projectId, branch, review_queries, llm, mr_title, mr_description, mr_iid)
         return result
 
 
     except Exception as e:
         logger.info(f"오류 발생: {e}")
-        return '', '', []
+        return '', '', [], []
 
     finally:
         # 리소스 정리
@@ -308,7 +333,7 @@ def build_retrieval_queries(diff, changed_blocks, changed_file_context):
     return queries[:3]
 
 
-def query_relevant_code(vectorDB, retrieval_queries):
+def query_relevant_code(vectorDB, retrieval_queries, changed_path='', categories=None, changed_symbols=None):
     results = []
     seen = set()
     for query in retrieval_queries:
@@ -319,7 +344,54 @@ def query_relevant_code(vectorDB, retrieval_queries):
                 continue
             seen.add(fingerprint)
             results.append(item)
-    return results[:6]
+    return rerank_code_results(results, changed_path, categories or [], changed_symbols or [])[:6]
+
+
+def rerank_code_results(results, changed_path, categories, changed_symbols):
+    def score(item):
+        distance = item.get('score', 1.0) if isinstance(item, dict) else 1.0
+        value = -distance
+        for reason, weight in code_match_reasons(item, changed_path, categories, changed_symbols):
+            value += weight
+        return value
+
+    reranked = sorted(results, key=score, reverse=True)
+    for item in reranked:
+        if isinstance(item, dict):
+            reasons = [reason for reason, _ in code_match_reasons(item, changed_path, categories, changed_symbols)]
+            item['reason'] = ', '.join(reasons) if reasons else 'embedding similarity'
+    return reranked
+
+
+def code_match_reasons(item, changed_path, categories, changed_symbols):
+    if not isinstance(item, dict):
+        return []
+
+    metadata = item.get('metadata', {})
+    content = item.get('content', '')
+    reasons = []
+
+    path = metadata.get('path', item.get('path', ''))
+    if path == changed_path:
+        reasons.append(('same file', 0.6))
+    if path and changed_path and Path(path).parent == Path(changed_path).parent:
+        reasons.append(('same module path', 0.35))
+
+    category_hints = metadata.get('categoryHints', '')
+    for category in categories:
+        if category and category in category_hints:
+            reasons.append((f"same category: {category}", 0.5))
+            break
+
+    metadata_symbols = metadata.get('symbols', '')
+    for symbol in changed_symbols:
+        if symbol and (symbol in metadata_symbols or symbol in content):
+            reasons.append((f"symbol overlap: {symbol}", 0.45))
+            break
+
+    if metadata.get('className') and metadata.get('className') in changed_path:
+        reasons.append((f"class match: {metadata.get('className')}", 0.2))
+    return reasons
 
 
 def format_similar_codes(similar_codes):
@@ -331,9 +403,17 @@ def format_similar_codes(similar_codes):
         if isinstance(item, dict):
             path = item.get('path', 'unknown')
             language = item.get('language', 'unknown')
+            metadata = item.get('metadata', {})
             content = item.get('content', '')
+            details = []
+            for key in ['module', 'className', 'methodName', 'categoryHints']:
+                if metadata.get(key):
+                    details.append(f"{key}={metadata[key]}")
+            metadata_text = f" ({'; '.join(details)})" if details else f" ({language})"
+            reason = item.get('reason', 'embedding similarity')
             formatted.append(
-                f"[similar {index}: {path} ({language})]\n"
+                f"[similar {index}: {path}{metadata_text}]\n"
+                f"reason: {reason}\n"
                 f"{truncate_text(content, MAX_SIMILAR_CODE_CHARS)}"
             )
         else:
@@ -341,17 +421,21 @@ def format_similar_codes(similar_codes):
     return "\n\n---\n\n".join(formatted)
 
 
-def parse_review_json(raw_result):
-    cleaned = raw_result.strip()
-    cleaned = cleaned.replace('```json', '').replace('```html', '').replace('```', '').strip()
-    start = cleaned.find('{')
-    end = cleaned.rfind('}')
-    if start != -1 and end != -1 and start < end:
-        cleaned = cleaned[start:end + 1]
-    return json.loads(cleaned)
+def build_evidence_pack(review_query):
+    return "\n\n".join([
+        f"## Change\nfile={review_query.get('path')}\nlanguage={review_query.get('language')}",
+        f"## Classification\n{review_query.get('classification', '')}",
+        f"## Changed Code\n### Changed Blocks\n{review_query.get('changed_blocks', '')}\n\n"
+        f"### Changed File Context\n{review_query.get('surrounding_context', '')}",
+        f"## Related Code / Similar Implementations\n{review_query.get('similar_codes', '')}",
+        f"## Project Rule Evidence\n{review_query.get('project_rules', '')}",
+        f"## API Contract Evidence\n{review_query.get('api_contracts', '')}",
+        f"## Architecture Decision Evidence\n{review_query.get('architecture_decisions', '')}",
+        f"## Historical Review Findings\n{review_query.get('historical_findings', '')}",
+    ])
 
 
-def get_code_review(projectId, branch, review_queries, llm, mr_title='', mr_description=''):
+def get_code_review(projectId, branch, review_queries, llm, mr_title='', mr_description='', mr_iid=''):
     uuid = generate_uuid()
     portfolio_memory = ConversationBufferMemory(
         memory_key=f"{projectId}_portfolio_{uuid}",
@@ -381,14 +465,8 @@ def get_code_review(projectId, branch, review_queries, llm, mr_title='', mr_desc
     === 변경된 코드 (git diff) ===
     {code_chunk}
 
-    === 변경 블록과 라인 참조 ===
-    {changed_blocks}
-
-    === 변경 파일 주변 컨텍스트 ===
-    {surrounding_context}
-
-    === 참고할 기존 유사 코드 ===
-    {similar_codes}
+    === Evidence Pack ===
+    {evidence_pack}
 
     다음 형식으로만 작성하세요.
     - must_fix: 실제 버그, 보안 문제, 계약 위반, 운영 장애 가능성이 있는 항목
@@ -398,15 +476,17 @@ def get_code_review(projectId, branch, review_queries, llm, mr_title='', mr_desc
 
     각 finding은 반드시 아래 정보를 포함하세요.
     - file: 파일 경로
-    - line: diff의 라인 또는 changed block 참조. 모르면 "changed block"이라고 쓰세요.
+    - line: 가능하면 변경된 새 파일의 숫자 라인만 쓰세요. 모르면 "changed block"이라고 쓰세요.
     - issue: 무엇이 문제인지 한 문장
     - why_it_matters: 실제 영향
     - suggestion: 구체적인 수정 방향
+    - evidence: Evidence Pack의 source 또는 section 중 어떤 근거를 사용했는지
 
     금지:
     - 변경사항을 길게 요약하지 마세요.
     - 모든 카테고리를 억지로 채우지 마세요.
-    - 참고 코드가 직접 관련 없으면 언급하지 마세요.
+    - 관련 코드나 프로젝트 문서 근거가 직접 관련 없으면 언급하지 마세요.
+    - Evidence Pack과 무관한 일반론을 근거처럼 쓰지 마세요.
     - 추측성 보안/성능 지적을 만들지 마세요.
     """)
 
@@ -416,7 +496,7 @@ def get_code_review(projectId, branch, review_queries, llm, mr_title='', mr_desc
         실제 문제가 없는 카테고리는 비워두거나 생략하세요.
 
         * 중요: 응답은 JSON 형식으로 다음 구조를 따라 작성해주세요:
-        * techStack 은 ["JavaScript", "TypeScript", "HTML5", "CSS3", "Sass", "Bootstrap", "TailwindCSS", "React", "Angular", 
+        * techStacks 은 ["JavaScript", "TypeScript", "HTML5", "CSS3", "Sass", "Bootstrap", "TailwindCSS", "React", "Angular", 
   "Vue", "Svelte", "jQuery", "Node", "Express", "NestJS", "NextJS", "NuxtJS", "Python", "Django", "Flask", 
   "Java", "Spring", "PHP", "Laravel", "Ruby", "Rails", "CSharp", "DotNet", "Cplusplus", "Go", "Rust", 
   "Swift", "Kotlin", "Docker", "Kubernetes", "AWS", "Firebase", "GoogleCloud", "Azure", "Heroku", 
@@ -424,8 +504,20 @@ def get_code_review(projectId, branch, review_queries, llm, mr_title='', mr_desc
   "GitLab", "Bitbucket", "Jenkins", "TravisCI", "CircleCI", "NGINX", "Vercel"] 해당 배열 안에서 골라줘
   
         {{
-            "review": "<코드리뷰 내용을 HTML 형식으로 작성>",
-            "techStack": ["사용된 기술스택 목록"]
+            "findings": [
+                {{
+                    "severity": "must_fix | should_fix | nit | positive",
+                    "category": "auth | api-contract | async | security | persistence | operations | rag-review | testing",
+                    "file": "변경 파일 경로",
+                    "line": "변경된 새 파일의 숫자 라인 또는 changed block",
+                    "issue": "문제 한 문장",
+                    "whyItMatters": "실제 영향",
+                    "suggestion": "구체적인 수정 방향",
+                    "evidence": ["프로젝트 문서 또는 관련 코드 근거"]
+                }}
+            ],
+            "summary": "MR 리뷰 핵심 요약",
+            "techStacks": ["사용된 기술스택 목록"]
         }}
 
         MR 제목: {mr_title}
@@ -435,22 +527,12 @@ def get_code_review(projectId, branch, review_queries, llm, mr_title='', mr_desc
         ===파일별 리뷰 근거===
         {history}
 
-        review HTML은 다음 구조를 따르세요.
-        <h3>Code Review</h3>
-        <h4>Must Fix</h4>
-        <ul><li><strong>파일:라인</strong> - 문제 / 영향 / 제안</li></ul>
-        <h4>Should Fix</h4>
-        <ul><li><strong>파일:라인</strong> - 문제 / 영향 / 제안</li></ul>
-        <h4>Nit</h4>
-        <ul><li><strong>파일:라인</strong> - 문제 / 제안</li></ul>
-        <h4>Positive</h4>
-        <ul><li><strong>파일</strong> - 유지할 만한 좋은 변경</li></ul>
+        finding이 하나도 없으면 findings는 빈 배열로 두세요.
+        각 finding은 반드시 evidence를 포함해야 합니다.
+        evidence가 없다면 finding으로 만들지 마세요.
 
-        finding이 하나도 없으면 review에 다음 문장만 포함하세요:
-        <h3>Code Review</h3><p>No blocking findings. The change looks reasonable based on the provided diff and context.</p>
-
-        응답은 반드시 위의 JSON 형식을 준수해야 하며, HTML 내용은 실제 복사-붙여넣기가 가능해야 합니다.
-        techStack 배열에는 코드에서 사용된 주요 기술들(SpringBoot, React 등)을 포함해주세요.
+        응답은 반드시 위의 JSON 형식을 준수해야 합니다.
+        techStacks 배열에는 코드에서 사용된 주요 기술들(SpringBoot, React 등)을 포함해주세요.
     """)
 
     portfolio_prompt = ChatPromptTemplate.from_template("""
@@ -516,13 +598,18 @@ def get_code_review(projectId, branch, review_queries, llm, mr_title='', mr_desc
 
         try:
             # 2. 문자열을 JSON으로 파싱
-            jsonData = parse_review_json(code_review_result)
+            jsonData = normalize_review_payload(parse_model_json(code_review_result))
             logger.info(jsonData)
             # 3. 파싱된 JSON 데이터 사용
-            logger.info(f"{jsonData['review']}\n === \n{jsonData.get('techStack', [])}")
+            logger.info(f"{jsonData['review']}\n === \n{jsonData.get('techStacks', [])}")
+            persist_review_findings(projectId, mr_iid, jsonData.get('findings', []))
 
-            return re.sub(r'<title>.*?</title>', '', jsonData['review'].replace('\n', '')), portfolio_result, jsonData.get(
-                'techStack', [])
+            return (
+                re.sub(r'<title>.*?</title>', '', jsonData['review'].replace('\n', '')),
+                portfolio_result,
+                jsonData.get('techStacks', []),
+                jsonData.get('findings', [])
+            )
         except json.JSONDecodeError as e:
             logger.info(f"JSON 파싱 에러: {e}")
             fallback_review = (
@@ -530,11 +617,11 @@ def get_code_review(projectId, branch, review_queries, llm, mr_title='', mr_desc
                 "<p>Review generation completed, but the model response was not valid JSON. "
                 "Please retry the review.</p>"
             )
-            return fallback_review, portfolio_result, []
+            return fallback_review, portfolio_result, [], []
 
     except Exception as e:
         logger.info(f"리뷰 중 오류 발생: {e}")
-        return str(e), '', []
+        return str(e), '', [], []
 
     finally:
         portfolio_memory.clear()
@@ -599,9 +686,7 @@ def chunked_review(project_id, llm, review_query: dict, review_chain, code_revie
                 result = review_chain.invoke({
                     "file_path": f"{file_path} (Part {i + 1}/{len(code_chunks)})",
                     "code_chunk": chunk,
-                    "changed_blocks": review_query.get('changed_blocks', ''),
-                    "surrounding_context": review_query.get('surrounding_context', ''),
-                    "similar_codes": review_query.get('similar_codes', ''),
+                    "evidence_pack": review_query.get('evidence_pack', ''),
                     "branch": branch,
                     "mr_title": default_if_blank(mr_title, "Unavailable"),
                     "mr_description": default_if_blank(mr_description, "Unavailable")

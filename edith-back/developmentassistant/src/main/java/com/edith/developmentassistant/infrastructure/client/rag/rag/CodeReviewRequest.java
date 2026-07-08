@@ -10,6 +10,7 @@ public class CodeReviewRequest {
     String url;
     String token;
     String projectId;
+    String mrIid;
     String branch;
     String mrTitle;
     String mrDescription;

@@ -1,12 +1,14 @@
 package com.edith.developmentassistant.infrastructure.external.gitlab;
 
 import com.edith.developmentassistant.infrastructure.external.gitlab.dto.CommentRequest;
+import com.edith.developmentassistant.infrastructure.external.gitlab.dto.GitLabDiscussionRequest;
 import com.edith.developmentassistant.infrastructure.external.gitlab.dto.GitMerge;
 
 import com.edith.developmentassistant.infrastructure.external.gitlab.dto.ContributorDto;
 
 import com.edith.developmentassistant.infrastructure.external.gitlab.dto.ProjectAccessTokenRequest;
 import com.edith.developmentassistant.infrastructure.external.gitlab.dto.RegisterWebhookRequest;
+import com.edith.developmentassistant.infrastructure.external.gitlab.dto.mergerequest.DiffRefs;
 import com.edith.developmentassistant.infrastructure.external.gitlab.dto.mergerequest.MergeRequestDiffResponse;
 import com.edith.developmentassistant.infrastructure.external.gitlab.dto.GitCommit;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -149,6 +151,28 @@ public class GitLabApi {
         addCommnet(projectId, mergeRequestIid, token, summary, url);
         addCommnet(projectId, mergeRequestIid, token, review, url);
 
+    }
+
+    public boolean addMergeRequestDiscussion(Long projectId, Long mergeRequestIid, String token, String path,
+                                             int newLine, DiffRefs diffRefs, String body) {
+        String url = GITLAB_API_URL + "/projects/" + projectId + "/merge_requests/" + mergeRequestIid + "/discussions";
+        GitLabDiscussionRequest discussionRequest = GitLabDiscussionRequest.textPosition(body, path, newLine, diffRefs);
+        HttpHeaders headers = createHeader(token);
+        HttpEntity<GitLabDiscussionRequest> requestEntity = new HttpEntity<>(discussionRequest, headers);
+
+        try {
+            log.info("Adding inline discussion to MR ID {} in project {} at {}:{}", mergeRequestIid, projectId, path,
+                    newLine);
+            ResponseEntity<Void> response = restTemplate.exchange(url, HttpMethod.POST, requestEntity, Void.class);
+            if (response.getStatusCode().is2xxSuccessful()) {
+                log.info("Inline discussion added successfully to MR.");
+                return true;
+            }
+            log.error("Failed to add inline discussion. Status code: {}", response.getStatusCode());
+        } catch (Exception ex) {
+            log.error("Error adding inline discussion to MR: {}", ex.getMessage(), ex);
+        }
+        return false;
     }
 
     private void addCommnet(Long projectId, Long mergeRequestIid, String token, String review, String url) {
