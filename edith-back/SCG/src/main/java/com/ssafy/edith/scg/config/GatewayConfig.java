@@ -11,7 +11,7 @@ public class GatewayConfig {
     @Bean
     public RouteLocator websocketRoutes(RouteLocatorBuilder builder) {
         return builder.routes()
-                .route("websocket_route", r -> r.path("/ws/v1/face-recognition/face_login")
+                .route("websocket_route", r -> r.path("/ws/v1/face-recognition/face-login")
                         .uri("ws://face-recognition-fastapi-service:8184"))
                 .build();
     }

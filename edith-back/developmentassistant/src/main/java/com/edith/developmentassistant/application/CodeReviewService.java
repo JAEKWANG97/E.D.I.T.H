@@ -24,6 +24,7 @@ import java.util.Set;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
 @Slf4j
@@ -42,6 +43,7 @@ public class CodeReviewService {
         gitLabApi.registerWebhook(request.id(), token);
     }
 
+    @Async("codeReviewExecutor")
     public void commentCodeReview(WebhookEvent webhookEvent) {
         Long projectId = (long) webhookEvent.getProject().getId();
         Long mergeRequestIid = (long) webhookEvent.getObjectAttributes().getIid();

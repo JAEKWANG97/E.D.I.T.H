@@ -21,6 +21,7 @@ import java.util.List;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
@@ -40,7 +41,9 @@ public class GitLabApi {
     private static final String REGISTER_HOOK_ENDPOINT = "/projects/";
     private static final String MR_DIFF_ENDPOINT = "/projects/%d/merge_requests/%d/changes"; // DIFF 엔드포인트
     private static final String TOKEN_NAME = "E.D.I.T.H";
-    private static final String WEBHOOK_URL = "https://edith-ai.xyz:30443/webhook";
+
+    @Value("${gitlab.webhook-url}")
+    private String webhookUrl;
 
     private final RestTemplate restTemplate;
     private final ObjectMapper objectMapper;
@@ -317,7 +320,7 @@ public class GitLabApi {
 
     private RegisterWebhookRequest createRequestBody() {
         return RegisterWebhookRequest.builder()
-                .url(WEBHOOK_URL)
+                .url(webhookUrl)
                 .description("Development Assistant Webhook")
                 .pushEvents(true)
                 .tagPushEvents(true)
@@ -413,13 +416,6 @@ public class GitLabApi {
                 url, HttpMethod.GET, entity, new ParameterizedTypeReference<List<GitMerge>>() {
                 }
         );
-
-        ResponseEntity<String> responseJson = restTemplate.exchange(
-                url, HttpMethod.GET, entity, new ParameterizedTypeReference<String>() {
-                }
-        );
-
-        log.info("responseJson : {}", responseJson);
 
         List<GitMerge> todayMerges = response.getBody();
         assert todayMerges != null;

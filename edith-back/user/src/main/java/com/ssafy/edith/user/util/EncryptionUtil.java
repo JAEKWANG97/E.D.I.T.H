@@ -1,5 +1,6 @@
 package com.ssafy.edith.user.util;
 
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import javax.crypto.Cipher;
@@ -10,11 +11,16 @@ import java.util.Base64;
 @Component
 public class EncryptionUtil {
     private static final String ALGORITHM = "AES";
-    private static final String SECRET_KEY = "testSecretKey123";
+
+    private static String secretKey;
+
+    public EncryptionUtil(@Value("${encryption.secret-key}") String secretKey) {
+        EncryptionUtil.secretKey = secretKey;
+    }
 
     private static SecretKeySpec getSecretKeySpec() throws Exception { //SECRET_KEY SHA-256으로 동적생성
         MessageDigest sha = MessageDigest.getInstance("SHA-256");
-        byte[] key = sha.digest(SECRET_KEY.getBytes("UTF-8"));
+        byte[] key = sha.digest(secretKey.getBytes("UTF-8"));
         return new SecretKeySpec(key, ALGORITHM);
     }
 

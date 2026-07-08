@@ -7,3 +7,6 @@ spring:
 
 server:
   port: 8081
+
+encryption:
+  secret-key: ${ENCRYPTION_SECRET_KEY:testSecretKey123}

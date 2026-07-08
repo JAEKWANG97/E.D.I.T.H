@@ -26,3 +26,6 @@ api:
 #    portfolio: http://localhost:8083/rag/portfolio # 로컬
     rag : http://rag-flask-service:8183/rag
 
+gitlab:
+  webhook-url: ${GITLAB_WEBHOOK_URL:https://edith-ai.xyz:30443/api/v1/webhook}
+
