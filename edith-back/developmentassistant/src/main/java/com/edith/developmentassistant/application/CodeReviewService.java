@@ -65,7 +65,8 @@ public class CodeReviewService {
 
             log.info("Decoded Advice: {}", advice);
 
-            CodeReviewResponse response = requestCodeReview(projectId, project.getToken(), mergeDiff, changes);
+            CodeReviewResponse response = requestCodeReview(projectId, project.getToken(), mergeDiff, changes,
+                    webhookEvent.getObjectAttributes().getTitle(), webhookEvent.getObjectAttributes().getDescription());
 
             log.info("Decoded Response: {}", response);
 
@@ -109,11 +110,14 @@ public class CodeReviewService {
     }
 
     private CodeReviewResponse requestCodeReview(Long projectId, String token, MergeRequestDiffResponse mergeDiff,
-                                                 List<CodeReviewChanges> changes) {
+                                                 List<CodeReviewChanges> changes, String mrTitle,
+                                                 String mrDescription) {
         CodeReviewRequest request = CodeReviewRequest.builder()
                 .url("https://lab.ssafy.com")
                 .projectId(projectId.toString())
                 .branch(mergeDiff.getTargetBranch())
+                .mrTitle(mrTitle)
+                .mrDescription(mrDescription)
                 .token(token)
                 .changes(changes)
                 .build();

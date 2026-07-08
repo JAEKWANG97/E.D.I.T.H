@@ -22,8 +22,28 @@ class CodeEmbeddingProcessor:
     # Chunk 코드 임베딩
     def store_embeddings(self, code_snippets):
         try:
+            texts = []
+            metadatas = []
+            for snippet in code_snippets:
+                if isinstance(snippet, dict):
+                    text = snippet.get('text') or snippet.get('code') or ''
+                    if not text:
+                        continue
+                    texts.append(text)
+                    metadatas.append({
+                        'path': snippet.get('path', 'unknown'),
+                        'language': snippet.get('language', 'unknown')
+                    })
+                else:
+                    texts.append(str(snippet))
+                    metadatas.append({'path': 'unknown', 'language': 'unknown'})
+
+            if not texts:
+                return True
+
             self.db.add_texts(
-                texts=code_snippets,
+                texts=texts,
+                metadatas=metadatas,
             )
             return True
         except Exception as e:
@@ -37,7 +57,12 @@ class CodeEmbeddingProcessor:
                 query=code_snippet,
                 k=n_results
             )
-            related_codes = [doc.page_content for doc, score in results]
+            related_codes = [{
+                'path': doc.metadata.get('path', 'unknown'),
+                'language': doc.metadata.get('language', 'unknown'),
+                'content': doc.page_content,
+                'score': score
+            } for doc, score in results]
             return related_codes
         except Exception as e:
             print(f"Error querying similar code: {e}")

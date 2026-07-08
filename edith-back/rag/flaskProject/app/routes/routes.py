@@ -72,9 +72,12 @@ def code_review():
     projectId = data.get('projectId')
     branch = data.get('branch')
     changes = data.get('changes')
+    mr_title = data.get('mrTitle') or data.get('title') or ''
+    mr_description = data.get('mrDescription') or data.get('description') or ''
     logger.info(f'code review make = {projectId}')
 
-    review, portfolio, techStack = reviewer.getCodeReview(url, token, projectId, branch, changes)
+    review, portfolio, techStack = reviewer.getCodeReview(url, token, projectId, branch, changes, mr_title,
+                                                           mr_description)
     if review and portfolio:
         return jsonify({'status': 'success', 'review': review, 'techStacks': techStack, 'summary': portfolio})
     else:

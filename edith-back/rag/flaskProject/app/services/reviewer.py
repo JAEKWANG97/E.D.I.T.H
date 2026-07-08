@@ -15,8 +15,12 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+MAX_CONTEXT_CHARS = 6000
+MAX_SIMILAR_CODE_CHARS = 1400
+MAX_RETRIEVAL_QUERY_CHARS = 2500
 
-def getCodeReview(url, token, projectId, branch, changes):
+
+def getCodeReview(url, token, projectId, branch, changes, mr_title='', mr_description=''):
     chunker = None
     vectorDB = None
     uuid = generate_uuid()
@@ -36,7 +40,7 @@ def getCodeReview(url, token, projectId, branch, changes):
         # 2. 파일별 임베딩
         project_path = chunker.clone_project()
         if not project_path:
-            return '', ''
+            return '', '', []
 
         # 3. 리뷰 할 코드들 메서드 Chunking
         file_chunks = []
@@ -63,9 +67,14 @@ def getCodeReview(url, token, projectId, branch, changes):
 
                 # changes 의 path 필드에 존재하는 파일 확장자명만 임베딩
                 if language in relevant_extensions:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        chunks = chunker.chunk_file(str(file_path), language)
-                        file_chunks.extend(chunks)
+                    chunks = chunker.chunk_file(str(file_path), language)
+                    relative_path = str(file_path.relative_to(project_path))
+                    for chunk in chunks:
+                        file_chunks.append({
+                            'text': chunk,
+                            'path': relative_path,
+                            'language': language
+                        })
 
         vectorDB.store_embeddings(file_chunks)
 
@@ -75,41 +84,35 @@ def getCodeReview(url, token, projectId, branch, changes):
 
             if (language == ''):
                 continue
-            removed_lines, added_lines = parse_git_diff(change['diff'])
-            similar_codes = ["""def query_similar_code(self, code_snippet, n_results=5):
-        try:
-            results = self.db.similarity_search_with_score(
-                query=code_snippet,
-                k=n_results
-            )
-            related_codes = [doc.page_content for doc, score in results]
-            return related_codes
-        except Exception as e:
-            logger.info(f"Error querying similar code: {e}")
-            return []"""]
-            code_chunks = []
 
-            # 코드 임베딩
-            for added_line in added_lines:
-                method = chunker.chunk_code(added_line, language)
-                code_chunks.extend(method)
-            # 유사도 분석
-            for code_chunk in code_chunks:
-                similar_codes.append(vectorDB.query_similar_code(code_chunk, 5))
-            review_queries.append([change['path'], change['diff'], similar_codes])
+            diff = change.get('diff', '')
+            changed_blocks = parse_changed_blocks(diff)
+            changed_file_context = build_changed_file_context(project_path, change['path'], changed_blocks, chunker,
+                                                              language)
+            retrieval_queries = build_retrieval_queries(diff, changed_blocks, changed_file_context)
+            similar_codes = query_relevant_code(vectorDB, retrieval_queries)
+
+            review_queries.append({
+                'path': change['path'],
+                'language': language,
+                'diff': diff,
+                'changed_blocks': format_changed_blocks(changed_blocks),
+                'surrounding_context': changed_file_context,
+                'similar_codes': format_similar_codes(similar_codes)
+            })
 
         # 5. 메서드 별 관련 코드 가져와 리트리버 생성, 질의
         llm_model = LLMModel()
         llm = llm_model.llm
 
         # 6. LLM 에 질의해 결과 반환
-        result = get_code_review(projectId, review_queries, llm)
+        result = get_code_review(projectId, branch, review_queries, llm, mr_title, mr_description)
         return result
 
 
     except Exception as e:
         logger.info(f"오류 발생: {e}")
-        return '', ''
+        return '', '', []
 
     finally:
         # 리소스 정리
@@ -143,7 +146,212 @@ def get_language_from_extension(file_name: str) -> str:
     return language_map.get(extension, '')
 
 
-def get_code_review(projectId, review_queries, llm):
+def read_text_file(file_path):
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return f.read()
+    except UnicodeDecodeError:
+        with open(file_path, 'r', encoding='latin-1') as f:
+            return f.read()
+
+
+def truncate_text(text, max_chars):
+    if not text:
+        return ''
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n... [truncated]"
+
+
+def default_if_blank(value, fallback):
+    if value is None or str(value).strip() == '':
+        return fallback
+    return value
+
+
+def normalize_code_line(line):
+    return re.sub(r'\s+', ' ', line).strip()
+
+
+def parse_changed_blocks(diff_string):
+    blocks = []
+    current_block = None
+    new_line_number = None
+
+    def flush_block():
+        nonlocal current_block
+        if current_block and current_block['lines']:
+            blocks.append(current_block)
+        current_block = None
+
+    for raw_line in diff_string.split('\n'):
+        hunk_match = re.match(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@', raw_line)
+        if hunk_match:
+            flush_block()
+            new_line_number = int(hunk_match.group(1))
+            continue
+
+        if raw_line.startswith('+++') or raw_line.startswith('---'):
+            continue
+
+        if raw_line.startswith('+'):
+            if current_block is None:
+                current_block = {
+                    'start_line': new_line_number,
+                    'end_line': new_line_number,
+                    'lines': []
+                }
+            current_block['lines'].append(raw_line[1:])
+            current_block['end_line'] = new_line_number
+            if new_line_number is not None:
+                new_line_number += 1
+        elif raw_line.startswith('-'):
+            flush_block()
+        else:
+            flush_block()
+            if new_line_number is not None:
+                new_line_number += 1
+
+    flush_block()
+    return blocks
+
+
+def format_changed_blocks(changed_blocks):
+    if not changed_blocks:
+        return 'No added or modified lines were detected in the diff.'
+
+    formatted_blocks = []
+    for block in changed_blocks:
+        start_line = block.get('start_line')
+        end_line = block.get('end_line')
+        if start_line is None:
+            line_ref = "changed block"
+        elif start_line == end_line:
+            line_ref = f"line {start_line}"
+        else:
+            line_ref = f"lines {start_line}-{end_line}"
+        formatted_blocks.append(f"@@ {line_ref} @@\n" + "\n".join(block.get('lines', [])))
+    return "\n\n".join(formatted_blocks)
+
+
+def find_relevant_chunks(file_content, file_chunks, changed_blocks):
+    changed_lines = [
+        normalize_code_line(line)
+        for block in changed_blocks
+        for line in block.get('lines', [])
+        if normalize_code_line(line)
+    ]
+    relevant_chunks = []
+
+    for chunk in file_chunks:
+        normalized_chunk = normalize_code_line(chunk)
+        if any(line and line in normalized_chunk for line in changed_lines):
+            relevant_chunks.append(chunk)
+
+    if relevant_chunks:
+        return relevant_chunks
+
+    file_lines = file_content.splitlines()
+    windows = []
+    for block in changed_blocks:
+        start_line = block.get('start_line')
+        end_line = block.get('end_line')
+        if not start_line or not end_line:
+            continue
+        start = max(0, start_line - 8)
+        end = min(len(file_lines), end_line + 7)
+        numbered_lines = [
+            f"{idx + 1}: {file_lines[idx]}"
+            for idx in range(start, end)
+        ]
+        windows.append("\n".join(numbered_lines))
+    return windows
+
+
+def build_changed_file_context(project_path, changed_path, changed_blocks, chunker, language):
+    file_path = Path(project_path) / changed_path
+    if not file_path.exists():
+        return 'Changed file is not present in the checked-out target branch.'
+
+    try:
+        file_content = read_text_file(file_path)
+        file_chunks = chunker.chunk_file(str(file_path), language)
+        relevant_chunks = find_relevant_chunks(file_content, file_chunks, changed_blocks)
+        if not relevant_chunks:
+            return truncate_text(file_content, MAX_CONTEXT_CHARS)
+
+        labeled_chunks = []
+        for index, chunk in enumerate(relevant_chunks[:4], 1):
+            labeled_chunks.append(f"[context {index}: {changed_path}]\n{chunk}")
+        return truncate_text("\n\n".join(labeled_chunks), MAX_CONTEXT_CHARS)
+    except Exception as e:
+        logger.info(f"Failed to build changed file context for {changed_path}: {e}")
+        return 'Changed file context could not be loaded.'
+
+
+def build_retrieval_queries(diff, changed_blocks, changed_file_context):
+    queries = []
+    for block in changed_blocks:
+        block_text = "\n".join(block.get('lines', []))
+        if len(normalize_code_line(block_text)) >= 30:
+            queries.append(truncate_text(block_text, MAX_RETRIEVAL_QUERY_CHARS))
+
+    if changed_file_context and changed_file_context not in {
+        'Changed file is not present in the checked-out target branch.',
+        'Changed file context could not be loaded.'
+    }:
+        queries.append(truncate_text(changed_file_context, MAX_RETRIEVAL_QUERY_CHARS))
+
+    if not queries:
+        queries.append(truncate_text(diff, MAX_RETRIEVAL_QUERY_CHARS))
+
+    return queries[:3]
+
+
+def query_relevant_code(vectorDB, retrieval_queries):
+    results = []
+    seen = set()
+    for query in retrieval_queries:
+        for item in vectorDB.query_similar_code(query, 4):
+            content = item.get('content') if isinstance(item, dict) else str(item)
+            fingerprint = normalize_code_line(content)[:300]
+            if not fingerprint or fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            results.append(item)
+    return results[:6]
+
+
+def format_similar_codes(similar_codes):
+    if not similar_codes:
+        return 'No relevant existing code was retrieved.'
+
+    formatted = []
+    for index, item in enumerate(similar_codes, 1):
+        if isinstance(item, dict):
+            path = item.get('path', 'unknown')
+            language = item.get('language', 'unknown')
+            content = item.get('content', '')
+            formatted.append(
+                f"[similar {index}: {path} ({language})]\n"
+                f"{truncate_text(content, MAX_SIMILAR_CODE_CHARS)}"
+            )
+        else:
+            formatted.append(f"[similar {index}: unknown]\n{truncate_text(str(item), MAX_SIMILAR_CODE_CHARS)}")
+    return "\n\n---\n\n".join(formatted)
+
+
+def parse_review_json(raw_result):
+    cleaned = raw_result.strip()
+    cleaned = cleaned.replace('```json', '').replace('```html', '').replace('```', '').strip()
+    start = cleaned.find('{')
+    end = cleaned.rfind('}')
+    if start != -1 and end != -1 and start < end:
+        cleaned = cleaned[start:end + 1]
+    return json.loads(cleaned)
+
+
+def get_code_review(projectId, branch, review_queries, llm, mr_title='', mr_description=''):
     uuid = generate_uuid()
     portfolio_memory = ConversationBufferMemory(
         memory_key=f"{projectId}_portfolio_{uuid}",
@@ -160,54 +368,53 @@ def get_code_review(projectId, review_queries, llm):
     )
 
     review_prompt = ChatPromptTemplate.from_template("""
-    아래는 변경된 코드와 참고할 유사 코드입니다. 유사 코드를 적극적으로 활용하여 변경된 코드에 대한 심도 있는 리뷰를 작성해주세요.
+    당신은 시니어 백엔드/풀스택 엔지니어로서 MR 코드리뷰를 수행합니다.
+    목표는 변경 설명이 아니라 실제 결함, 회귀 위험, 계약 변경, 보안, 예외 처리, 테스트 누락을 찾는 것입니다.
+    근거가 약하면 지적하지 마세요. 문제가 없으면 "no finding"이라고 명시하세요.
+
+    MR 제목: {mr_title}
+    MR 설명: {mr_description}
+    대상 브랜치: {branch}
 
     파일: {file_path}
 
     === 변경된 코드 (git diff) ===
     {code_chunk}
 
-    === 참고 코드 (유사 코드, 메서드, 함수) ===
+    === 변경 블록과 라인 참조 ===
+    {changed_blocks}
+
+    === 변경 파일 주변 컨텍스트 ===
+    {surrounding_context}
+
+    === 참고할 기존 유사 코드 ===
     {similar_codes}
 
-    ========================
-    다음 항목별로 자세히 작성해주세요:
+    다음 형식으로만 작성하세요.
+    - must_fix: 실제 버그, 보안 문제, 계약 위반, 운영 장애 가능성이 있는 항목
+    - should_fix: 유지보수성, 예외 처리, 테스트 누락 등 merge 전에 고치면 좋은 항목
+    - nit: 작은 스타일/가독성 항목. 없으면 생략
+    - positive: 유지할 만한 좋은 변경. 없으면 생략
 
-    0. **참고 코드와 변경된 코드의 비교 분석**:
-       - **유사점**: 구조, 로직, 패턴 등에서의 공통점
-       - **차이점**: 구현 방법, 성능, 오류 처리 등에서의 차이
-       - **참고 코드의 우수 사례 적용 여부**: 모범 사례가 적용되었는지 평가
+    각 finding은 반드시 아래 정보를 포함하세요.
+    - file: 파일 경로
+    - line: diff의 라인 또는 changed block 참조. 모르면 "changed block"이라고 쓰세요.
+    - issue: 무엇이 문제인지 한 문장
+    - why_it_matters: 실제 영향
+    - suggestion: 구체적인 수정 방향
 
-    1. **핵심 기능 설명**:
-       - 변경된 코드의 주요 기능과 목적 상세 설명
-       - 해결하고자 하는 문제나 요구사항 명확히 기술
-
-    2. **변경사항 상세 분석**:
-       - 추가되거나 변경된 로직에 대한 심층 분석
-       - 코드 흐름 및 데이터 처리 방식 설명
-
-    3. **잠재적 문제점 및 개선 가능성**:
-       - **버그 가능성**: 논리 오류나 예외 처리 누락 부분 식별
-       - **성능 이슈**: 시간 복잡도, 메모리 사용 측면에서의 비효율성 지적
-       - **보안 취약점**: 입력 검증 부족, 민감 데이터 노출 가능성 평가
-
-    4. **코드 품질 및 스타일 평가**:
-       - 가독성, 유지보수성, 일관성 측면에서의 평가
-       - 네이밍 컨벤션, 코드 구조, 주석 활용 등에 대한 피드백
-
-    5. **구체적인 수정 및 개선 제안**:
-       - 참고 코드를 기반으로 개선할 수 있는 부분 제안
-       - 구체적인 코드 예시 포함하여 수정 방안 제시
-
-    6. **추가 고려 사항**:
-       - 관련 문서나 라이브러리에 대한 참고 정보 제공
-       - 팀의 코딩 가이드라인이나 스타일 가이드와의 일치 여부 검토
-
-    응답은 반드시 위의 항목을 포함해야 하며, 각 항목은 명확하고 구체적으로 작성해주세요. 필요한 경우 코드를 예로 들어 설명하고, 유사 코드를 적극적으로 인용하여 비교 분석해주세요.
+    금지:
+    - 변경사항을 길게 요약하지 마세요.
+    - 모든 카테고리를 억지로 채우지 마세요.
+    - 참고 코드가 직접 관련 없으면 언급하지 마세요.
+    - 추측성 보안/성능 지적을 만들지 마세요.
     """)
 
     final_review_prompt = ChatPromptTemplate.from_template("""
         해당 MR의 전체 코드리뷰를 GitLab MR Comment 형식으로 작성해주세요.
+        설명식 요약보다 수정 가능한 finding을 우선하세요.
+        실제 문제가 없는 카테고리는 비워두거나 생략하세요.
+
         * 중요: 응답은 JSON 형식으로 다음 구조를 따라 작성해주세요:
         * techStack 은 ["JavaScript", "TypeScript", "HTML5", "CSS3", "Sass", "Bootstrap", "TailwindCSS", "React", "Angular", 
   "Vue", "Svelte", "jQuery", "Node", "Express", "NestJS", "NextJS", "NuxtJS", "Python", "Django", "Flask", 
@@ -221,19 +428,26 @@ def get_code_review(projectId, review_queries, llm):
             "techStack": ["사용된 기술스택 목록"]
         }}
 
-        ===파일별 주요 변경사항===
+        MR 제목: {mr_title}
+        MR 설명: {mr_description}
+        대상 브랜치: {branch}
+
+        ===파일별 리뷰 근거===
         {history}
 
-        # MR 전체 요약
-        - [전체 변경사항 핵심 요약]
-        - [전반적인 코드 품질/주의사항]
+        review HTML은 다음 구조를 따르세요.
+        <h3>Code Review</h3>
+        <h4>Must Fix</h4>
+        <ul><li><strong>파일:라인</strong> - 문제 / 영향 / 제안</li></ul>
+        <h4>Should Fix</h4>
+        <ul><li><strong>파일:라인</strong> - 문제 / 영향 / 제안</li></ul>
+        <h4>Nit</h4>
+        <ul><li><strong>파일:라인</strong> - 문제 / 제안</li></ul>
+        <h4>Positive</h4>
+        <ul><li><strong>파일</strong> - 유지할 만한 좋은 변경</li></ul>
 
-        # 주요 변경사항 상세 (중요하거나 핵심적인 파일만 작성)
-        ## [클래스명/파일명]
-        - 기능: [해당 파일 수정사항의 기능]
-        - 변경: [핵심 로직 변경사항]
-        - 잘한점, 고려해야할 점: [구현시 잘한점과 기존 코드와 중복되거나 고려해야할 점을 간략히]
-        - 수정해야할 사항: [수정이 반드시 필요한 사항만 실제 코드를 포함해 작성]
+        finding이 하나도 없으면 review에 다음 문장만 포함하세요:
+        <h3>Code Review</h3><p>No blocking findings. The change looks reasonable based on the provided diff and context.</p>
 
         응답은 반드시 위의 JSON 형식을 준수해야 하며, HTML 내용은 실제 복사-붙여넣기가 가능해야 합니다.
         techStack 배열에는 코드에서 사용된 주요 기술들(SpringBoot, React 등)을 포함해주세요.
@@ -273,14 +487,14 @@ def get_code_review(projectId, review_queries, llm):
     final_review_chain = final_review_prompt | llm | StrOutputParser()
 
     try:
-        for file_path, code_chunk, similar_codes in review_queries:
+        for review_query in review_queries:
 
             try:
-                review_result = chunked_review(projectId, llm, file_path, code_chunk, similar_codes, review_chain,
-                                               code_review_memory)
+                review_result = chunked_review(projectId, llm, review_query, review_chain, code_review_memory,
+                                               branch, mr_title, mr_description)
 
                 portfolio_memory.save_context(
-                    {"input": f"Review for {file_path}"},
+                    {"input": f"Review for {review_query['path']}"},
                     {"output": review_result}
                 )
             except Exception as e:
@@ -294,24 +508,33 @@ def get_code_review(projectId, review_queries, llm):
 
         code_review_result = final_review_chain.invoke({
             "input": "Generate final review",
-            "history": code_review_memory.load_memory_variables({})[f"{projectId}_code_review_{uuid}"]
-        }).replace('\n', '').replace('```html', '').replace('```', '').replace('json{', '{')
+            "history": code_review_memory.load_memory_variables({})[f"{projectId}_code_review_{uuid}"],
+            "branch": branch,
+            "mr_title": default_if_blank(mr_title, "Unavailable"),
+            "mr_description": default_if_blank(mr_description, "Unavailable")
+        })
 
         try:
             # 2. 문자열을 JSON으로 파싱
-            jsonData = json.loads(code_review_result)
+            jsonData = parse_review_json(code_review_result)
             logger.info(jsonData)
             # 3. 파싱된 JSON 데이터 사용
-            logger.info(f"{jsonData['review']}\n === \n{jsonData['techStack']}")
+            logger.info(f"{jsonData['review']}\n === \n{jsonData.get('techStack', [])}")
 
-            return re.sub(r'<title>.*?</title>', '', jsonData['review'].replace('\n', '')), portfolio_result, jsonData[
-                'techStack']
+            return re.sub(r'<title>.*?</title>', '', jsonData['review'].replace('\n', '')), portfolio_result, jsonData.get(
+                'techStack', [])
         except json.JSONDecodeError as e:
             logger.info(f"JSON 파싱 에러: {e}")
+            fallback_review = (
+                "<h3>Code Review</h3>"
+                "<p>Review generation completed, but the model response was not valid JSON. "
+                "Please retry the review.</p>"
+            )
+            return fallback_review, portfolio_result, []
 
     except Exception as e:
         logger.info(f"리뷰 중 오류 발생: {e}")
-        return str(e)
+        return str(e), '', []
 
     finally:
         portfolio_memory.clear()
@@ -348,15 +571,16 @@ def parse_git_diff(diff_string):
     return removed_lines, added_lines
 
 
-def chunked_review(project_id, llm, file_path: str, code_chunk: str, similar_codes: [], review_chain,
-                   code_review_memory,
+def chunked_review(project_id, llm, review_query: dict, review_chain, code_review_memory,
+                   branch, mr_title='', mr_description='',
                    max_token_limit: int = 4000) -> str:
     uuid = generate_uuid()
+    file_path = review_query['path']
     file_codeReview_memory = ConversationBufferMemory(
         memory_key=f"{project_id}_codereview_history_{uuid}",
         max_token_limit=4000,
         return_messages=True,
-        prompt="""해당 내용들로 코드리뷰가 가능하게 기능, 수정된 항목, 반드시 변경해야할 사항, 트러블 슈팅을 상세히 요약해"""
+        prompt="""해당 파일의 코드리뷰 finding만 보존해. 설명 요약보다 must_fix, should_fix, nit, positive 항목과 근거를 우선해."""
     )
 
     try:
@@ -367,17 +591,7 @@ def chunked_review(project_id, llm, file_path: str, code_chunk: str, similar_cod
         )
 
         # 코드 청크 분할
-        code_chunks = splitter.split_text(code_chunk)
-
-        # similar_codes를 문자열로 변환
-        similar_codes_str = ""
-        if similar_codes:
-            for code in similar_codes:
-                if isinstance(code, (list, tuple)):
-                    similar_codes_str += "\n".join(str(c) for c in code)
-                else:
-                    similar_codes_str += str(code)
-                similar_codes_str += "\n---\n"  # 각 코드 블록 구분
+        code_chunks = splitter.split_text(review_query['diff']) or [review_query['diff']]
 
         # 각 코드 청크에 대해 리뷰 수행
         for i, chunk in enumerate(code_chunks):
@@ -385,7 +599,12 @@ def chunked_review(project_id, llm, file_path: str, code_chunk: str, similar_cod
                 result = review_chain.invoke({
                     "file_path": f"{file_path} (Part {i + 1}/{len(code_chunks)})",
                     "code_chunk": chunk,
-                    "similar_codes": similar_codes_str
+                    "changed_blocks": review_query.get('changed_blocks', ''),
+                    "surrounding_context": review_query.get('surrounding_context', ''),
+                    "similar_codes": review_query.get('similar_codes', ''),
+                    "branch": branch,
+                    "mr_title": default_if_blank(mr_title, "Unavailable"),
+                    "mr_description": default_if_blank(mr_description, "Unavailable")
                 })
 
                 file_codeReview_memory.save_context(
@@ -401,8 +620,10 @@ def chunked_review(project_id, llm, file_path: str, code_chunk: str, similar_cod
         if file_codeReview_memory:
             # 여러 리뷰 결과를 하나로 통합하는 프롬프트
             merge_prompt = ChatPromptTemplate.from_template("""
-               다음은 하나의 파일에 대한 여러 부분의 리뷰 결과입니다.
-               이들을 하나의 리뷰로 통합해 MR 전체의 코드리뷰 작성시 참고할 수 있게 해
+               다음은 하나의 파일에 대한 여러 부분의 코드리뷰 결과입니다.
+               중복을 제거하고 실제 수정 가치가 있는 finding만 유지하세요.
+               must_fix, should_fix, nit, positive 구분을 보존하세요.
+               문제가 없다는 결론도 유지하세요.
     
                파일: {file_path}
                리뷰 결과들:
